@@ -1,426 +1,673 @@
-﻿# -*- coding: utf-8 -*-
+# -*- coding: utf-8 -*-
 """
-Z.ai 2 API
-将 Z.ai 代理为 OpenAI Compatible 格式，支持免令牌、智能处理思考链、图片上传（仅登录后）等功能
-基于 https://github.com/kbykb/OpenAI-Compatible-API-Proxy-for-Z 使用 AI 辅助重构。
+Z.ai → OpenAI-Compatible 代理 (Function Call + UTF-8 + SSE)
+- /v1/chat/completions 与 /v1/models
+- 严格兼容 OpenAI 工具调用：有 tool_calls 时 content=null、finish_reason=tool_calls
+- SSE 流式：携带 tools 时全程缓冲，结束后统一输出（避免客户端崩溃/乱码）
+- 明确 UTF-8：所有响应带 charset=utf-8；SSE 手动按 UTF-8 解码
 """
 
-import os, json, re, requests, logging, uuid, base64
-from datetime import datetime
+import os
+import json
+import re
+import time
+import logging
+from typing import List, Dict, Any, Optional, Iterable
+
+import requests
 from flask import Flask, request, Response, jsonify, make_response
 
-from dotenv import load_dotenv
-load_dotenv()
+# ==============================
+# 配置（环境变量优先）
+# ==============================
+API_BASE = os.getenv("ZAI_API_BASE", "https://chat.z.ai")
+DEFAULT_PORT = int(os.getenv("PORT", "8080"))
+DEFAULT_MODEL = os.getenv("DEFAULT_MODEL", "GLM-4.5")
+DEBUG_MODE = os.getenv("DEBUG", "true").lower() == "true"
 
-# 配置
-BASE = str(os.getenv("BASE", "https://chat.z.ai"))
-PORT = int(os.getenv("PORT", "8080"))
-MODEL = str(os.getenv("MODEL", "GLM-4.5"))
-TOKEN = str(os.getenv("TOKEN", "")).strip()
-DEBUG_MODE = str(os.getenv("DEBUG", "false")).lower() == "true"
-THINK_TAGS_MODE = str(os.getenv("THINK_TAGS_MODE", "reasoning"))
-ANONYMOUS_MODE = str(os.getenv("ANONYMOUS_MODE", "true")).lower() == "true"
+# 思考链模式: think | pure | raw
+THINK_TAGS_MODE = os.getenv("THINK_TAGS_MODE", "think")
 
-# tiktoken 预加载
-cache_dir = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'tiktoken') + os.sep
-os.environ["TIKTOKEN_CACHE_DIR"] = cache_dir
-assert os.path.exists(os.path.join(cache_dir, "9b5ad71b2ce5302211f9c61530b329a4922fc6a4")) # cl100k_base.tiktoken
-import tiktoken
-enc = tiktoken.get_encoding("cl100k_base")
+# 工具调用开关
+FUNCTION_CALL_ENABLED = os.getenv("FUNCTION_CALL_ENABLED", "true").lower() == "true"
+ANON_TOKEN_ENABLED = os.getenv("ANON_TOKEN_ENABLED", "true").lower() == "true"
+
+# 匿名失败时兜底用的上游 token（可为空）
+UPSTREAM_TOKEN = os.getenv("ZAI_UPSTREAM_TOKEN", "").strip()
+
+# 超时&重试
+HTTP_CONNECT_TIMEOUT = float(os.getenv("HTTP_CONNECT_TIMEOUT", "10"))
+HTTP_READ_TIMEOUT = float(os.getenv("HTTP_READ_TIMEOUT", "60"))
+TOKEN_TIMEOUT = float(os.getenv("TOKEN_TIMEOUT", "8"))
+RETRY_COUNT = int(os.getenv("RETRY_COUNT", "2"))
+RETRY_BACKOFF = float(os.getenv("RETRY_BACKOFF", "0.6"))
+
+# 其他
+MAX_JSON_SCAN = int(os.getenv("MAX_JSON_SCAN", "200000"))
+SSE_HEARTBEAT_SECONDS = float(os.getenv("SSE_HEARTBEAT_SECONDS", "15"))
 
 BROWSER_HEADERS = {
-	"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/139.0.0.0 Safari/537.36",
-	"Accept": "*/*",
-	"Accept-Language": "zh-CN,zh;q=0.9",
-	"X-FE-Version": "prod-fe-1.0.76",
-	"sec-ch-ua": '"Not;A=Brand";v="99", "Edge";v="139"',
-	"sec-ch-ua-mobile": "?0",
-	"sec-ch-ua-platform": '"Windows"',
-	"Origin": BASE,
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/139.0.0.0",
+    "Accept": "*/*",
+    "Accept-Language": "zh-CN,zh;q=0.9",
+    "X-FE-Version": "prod-fe-1.0.76",
+    "sec-ch-ua": '"Not;A=Brand";v="99", "Edge";v="139"',
+    "sec-ch-ua-mobile": "?0",
+    "sec-ch-ua-platform": '"Windows"',
+    "Origin": API_BASE,
 }
 
+# ==============================
 # 日志
-logging.basicConfig(level=logging.DEBUG if DEBUG_MODE else logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
-log = logging.getLogger(__name__)
+# ==============================
+logging.basicConfig(
+    level=logging.DEBUG if DEBUG_MODE else logging.INFO,
+    format="%(asctime)s - %(levelname)s - %(message)s",
+)
+log = logging.getLogger("zai2openai")
 
 def debug(msg, *args):
-	if DEBUG_MODE: log.debug(msg, *args)
+    if DEBUG_MODE:
+        log.debug(msg, *args)
 
-# Flask 应用
+# ==============================
+# Flask
+# ==============================
 app = Flask(__name__)
+app.config["JSON_AS_ASCII"] = False  # JSON 保持 UTF-8
 
-phaseBak = "thinking"
-# 工具函数
-class utils:
-	@staticmethod
-	class request:
-		@staticmethod
-		def chat(data, chat_id):
-			debug("收到请求: %s", json.dumps(data))
-			return requests.post(f"{BASE}/api/chat/completions", json=data, headers={**BROWSER_HEADERS, "Authorization": f"Bearer {utils.request.token()}", "Referer": f"{BASE}/c/{chat_id}"}, stream=True, timeout=60)
-		@staticmethod
-		def image(data_url, chat_id):
-			try:
-				if ANONYMOUS_MODE or not data_url.startswith("data:"):
-					return None
+# ==============================
+# 通用函数
+# ==============================
+def set_cors(resp: Response) -> Response:
+    resp.headers.update({
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+        "Access-Control-Allow-Headers": "Content-Type, Authorization",
+    })
+    return resp
 
-				header, encoded = data_url.split(",", 1)
-				mime_type = header.split(";")[0].split(":")[1] if ":" in header else "image/jpeg"
+def preflight() -> Response:
+    return set_cors(make_response("", 204))
 
-				image_data = base64.b64decode(encoded) # 解码数据
-				filename = str(uuid.uuid4())
+def now_ns_id(prefix="msg") -> str:
+    return f"{prefix}-{int(time.time() * 1e9)}"
 
-				debug("上传文件：%s", filename)
-				response = requests.post(f"{BASE}/api/v1/files/", files={"file": (filename, image_data, mime_type)}, headers={**BROWSER_HEADERS, "Authorization": f"Bearer {utils.request.token()}", "Referer": f"{BASE}/c/{chat_id}"}, timeout=30)
+def _safe_log_json(prefix: str, data: Any):
+    try:
+        scrub = json.loads(json.dumps(data))
+        for k in ("Authorization", "authorization"):
+            if isinstance(scrub, dict) and k in scrub:
+                scrub[k] = "***"
+        debug("%s %s", prefix, json.dumps(scrub, ensure_ascii=False)[:2000])
+    except Exception:
+        debug("%s <unserializable>", prefix)
 
-				if response.status_code == 200:
-					result = response.json()
-					return f"{result.get("id")}_{result.get("filename")}"
-				else:
-					raise Exception(response.text)
-			except Exception as e:
-				debug("图片上传失败: %s", e)
-			return None
-		@staticmethod
-		def id(prefix = "msg") -> str:
-			return f"{prefix}-{int(datetime.now().timestamp()*1e9)}"
-		@staticmethod
-		def token() -> str:
-			if not ANONYMOUS_MODE: return TOKEN
-			try:
-				r = requests.get(f"{BASE}/api/v1/auths/", headers=BROWSER_HEADERS, timeout=8)
-				token = r.json().get("token")
-				if token:
-					debug("获取匿名令牌: %s...", token[:15])
-					return token
-			except Exception as e:
-				debug("匿名令牌获取失败: %s", e)
-			return TOKEN
-		@staticmethod
-		def response(resp):
-			resp.headers.update({
-				"Access-Control-Allow-Origin": "*",
-				"Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-				"Access-Control-Allow-Headers": "Content-Type, Authorization",
-			})
-			return resp
-	@staticmethod
-	class response:
-		@staticmethod
-		def parse(stream):
-			for line in stream.iter_lines():
-				if not line or not line.startswith(b"data: "): continue
-				try: data = json.loads(line[6:].decode("utf-8", "ignore"))
-				except: continue
-				yield data
-		@staticmethod
-		def format(data):
-			data = data.get("data", "")
-			if not data: return None
-			phase = data.get("phase", "other")
-			content = data.get("delta_content") or data.get("edit_content") or ""
-			if not content: return None
-			contentBak = content
-			global phaseBak
-			if phase == "thinking" or (phase == "answer" and "summary>" in content):
-				content = re.sub(r"(?s)<details[^>]*?>.*?</details>", "", content)
-				content = content.replace("</thinking>", "").replace("<Full>", "").replace("</Full>", "")
+def get_requests_session() -> requests.Session:
+    s = requests.Session()
+    s.headers.update(BROWSER_HEADERS)
+    return s
 
-				if phase == "thinking":
-					content = re.sub(r'\n*<summary>.*?</summary>\n*', '\n\n', content)
+def get_token(session: requests.Session) -> str:
+    if not ANON_TOKEN_ENABLED:
+        return UPSTREAM_TOKEN
+    url = f"{API_BASE}/api/v1/auths/"
+    for i in range(RETRY_COUNT + 1):
+        try:
+            r = session.get(url, timeout=TOKEN_TIMEOUT)
+            r.raise_for_status()
+            token = r.json().get("token")
+            if token:
+                debug("匿名 token 获取成功 (前10位): %s...", token[:10])
+                return token
+        except Exception as e:
+            debug("匿名 token 获取失败[%s/%s]: %s", i + 1, RETRY_COUNT + 1, e)
+            if i < RETRY_COUNT:
+                time.sleep(RETRY_BACKOFF * (i + 1))
+    return UPSTREAM_TOKEN  # 可能为空，依上游策略
 
-				# 以 <reasoning> 为基底
-				content = re.sub(r"<details[^>]*>\n*", "<reasoning>\n\n", content)
-				content = re.sub(r"\n*</details>", "\n\n</reasoning>", content)
+def call_upstream_chat(session: requests.Session, data: Dict[str, Any], chat_id: str) -> requests.Response:
+    headers = {
+        **BROWSER_HEADERS,
+        "Authorization": f"Bearer {get_token(session)}",
+        "Referer": f"{API_BASE}/c/{chat_id}",
+    }
+    _safe_log_json("上游请求体:", data)
+    url = f"{API_BASE}/api/chat/completions"
+    for i in range(RETRY_COUNT + 1):
+        try:
+            r = session.post(
+                url, json=data, headers=headers, stream=True,
+                timeout=(HTTP_CONNECT_TIMEOUT, HTTP_READ_TIMEOUT)
+            )
+            if r.status_code // 100 != 2:
+                raise RuntimeError(f"Upstream HTTP {r.status_code}: {r.text[:2000]}")
+            return r
+        except Exception as e:
+            log.warning("上游调用失败[%s/%s]: %s", i + 1, RETRY_COUNT + 1, e)
+            if i < RETRY_COUNT:
+                time.sleep(RETRY_BACKOFF * (i + 1))
+            else:
+                raise
+    raise RuntimeError("上游调用失败（重试耗尽）")
 
-				if phase == "answer":
-					match = re.search(r"(?s)^(.*?</reasoning>)(.*)$", content) # 判断 </reasoning> 后是否有内容
-					if match:
-						before, after = match.groups()
-						if after.strip():
-							# </reasoning> 后有内容
-							if phaseBak == "thinking":
-								# 思考休止 → 结束思考，加上回答
-								content = f"\n\n</reasoning>\n\n{after.lstrip('\n')}"
-							elif phaseBak == "answer":
-								# 回答休止 → 清除所有
-								content = ""
-						else:
-							# 思考休止 → </reasoning> 后无内容
-							content = "\n\n</reasoning>"
+def parse_upstream_sse(upstream: requests.Response) -> Iterable[Dict[str, Any]]:
+    """按 UTF-8 解码 Z.ai 的 SSE 行"""
+    for raw in upstream.iter_lines(decode_unicode=False):
+        if not raw:
+            continue
+        if isinstance(raw, bytes):
+            s = raw.decode("utf-8", "ignore")
+        else:
+            s = raw
+        if not isinstance(s, str) or not s.startswith("data: "):
+            continue
+        try:
+            yield json.loads(s[6:])
+        except Exception:
+            continue
 
-				if THINK_TAGS_MODE == "reasoning":
-					if phase == "thinking": content = re.sub(r'\n>\s?', '\n', content)
-					content = re.sub(r'\n*<summary>.*?</summary>\n*', '', content)
-					content = re.sub(r"<reasoning>\n*", "", content)
-					content = re.sub(r"\n*</reasoning>", "", content)
-				elif THINK_TAGS_MODE == "think":
-					if phase == "thinking": content = re.sub(r'\n>\s?', '\n', content)
-					content = re.sub(r'\n*<summary>.*?</summary>\n*', '', content)
-					content = re.sub(r"<reasoning>", "<think>", content)
-					content = re.sub(r"</reasoning>", "</think>", content)
-				elif THINK_TAGS_MODE == "strip":
-					content = re.sub(r'\n*<summary>.*?</summary>\n*', '', content)
-					content = re.sub(r"<reasoning>\n*", "", content)
-					content = re.sub(r"</reasoning>", "", content)
-				elif THINK_TAGS_MODE == "details":
-					if phase == "thinking": content = re.sub(r'\n>\s?', '\n', content)
-					content = re.sub(r"<reasoning>", "<details type=\"reasoning\" open><div>", content)
-					thoughts = ""
-					if phase == "answer":
-						# 判断是否有 <summary> 内容
-						summary_match = re.search(r"(?s)<summary>.*?</summary>", before)
-						duration_match = re.search(r'duration="(\d+)"', before)
-						if summary_match:
-							# 有内容 → 直接照搬
-							thoughts = f"\n\n{summary_match.group()}"
-						# 判断是否有 duration 内容
-						elif duration_match:
-							# 有内容 → 通过 duration 生成 <summary>
-							thoughts = f'\n\n<summary>Thought for {duration_match.group(1)} seconds</summary>'
-					content = re.sub(r"</reasoning>", f"</div>{thoughts}</details>", content)
-				else:
-					content = re.sub(r"</reasoning>", "</reasoning>\n\n", content)
-					debug("警告：THINK_TAGS_MODE 传入了未知的替换模式，将使用 <reasoning> 标签。")
+# ==============================
+# 工具调用：注入 & 提取
+# ==============================
+def format_tools_for_prompt(tools: List[Dict]) -> str:
+    if not tools:
+        return ""
+    lines = []
+    for tool in tools:
+        if tool.get("type") != "function":
+            continue
+        fdef = tool.get("function", {}) or {}
+        name = fdef.get("name", "unknown")
+        desc = fdef.get("description", "")
+        params = fdef.get("parameters", {}) or {}
+        tool_desc = [f"- {name}: {desc}"]
+        props = params.get("properties", {}) or {}
+        required = set(params.get("required", []) or [])
+        for pname, pinfo in props.items():
+            ptype = (pinfo or {}).get("type", "any")
+            pdesc = (pinfo or {}).get("description", "")
+            req = " (required)" if pname in required else " (optional)"
+            tool_desc.append(f"  - {pname} ({ptype}){req}: {pdesc}")
+        lines.append("\n".join(tool_desc))
+    if not lines:
+        return ""
+    return (
+        "\n\n可用的工具函数:\n" + "\n".join(lines) +
+        "\n\n如果需要调用工具，请仅用以下 JSON 结构回复（不要包含多余文本）:\n"
+        "```json\n"
+        "{\n"
+        '  "tool_calls": [\n'
+        "    {\n"
+        '      "id": "call_xxx",\n'
+        '      "type": "function",\n'
+        '      "function": {\n'
+        '        "name": "function_name",\n'
+        '        "arguments": "{\\\"param1\\\": \\\"value1\\\"}"\n'
+        "      }\n"
+        "    }\n"
+        "  ]\n"
+        "}\n"
+        "```\n"
+    )
 
-			phaseBak = phase
-			if repr(content) != repr(contentBak):
-				debug("R 内容: %s %s", phase, repr(contentBak))
-				debug("W 内容: %s %s", phase, repr(content))
-			else:
-				debug("R 内容: %s %s", phase, repr(contentBak))
+def _content_to_str(content: Any) -> str:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts = []
+        for p in content:
+            if isinstance(p, dict) and p.get("type") == "text":
+                parts.append(p.get("text", ""))
+            elif isinstance(p, str):
+                parts.append(p)
+        return " ".join(parts)
+    return ""
 
-			if phase == "thinking" and THINK_TAGS_MODE == "reasoning":
-				return {"role": "assistant", "reasoning_content": content}
-			elif repr(content):
-				return {"role": "assistant", "content":content}
-			else:
-				return None
-		@staticmethod
-		def count(text):
-			return len(enc.encode(text))
+def _append_text_to_content(orig: Any, extra: str) -> Any:
+    if isinstance(orig, str):
+        return orig + extra
+    if isinstance(orig, list):
+        newc = list(orig)
+        if newc and isinstance(newc[-1], dict) and newc[-1].get("type") == "text":
+            newc[-1]["text"] = newc[-1].get("text", "") + extra
+        else:
+            newc.append({"type": "text", "text": extra})
+        return newc
+    return extra
 
+def process_messages_with_tools(messages: List[Dict],
+                                tools: Optional[List[Dict]] = None,
+                                tool_choice: Optional[Any] = None) -> List[Dict]:
+    processed: List[Dict] = []
+    if tools and FUNCTION_CALL_ENABLED and (tool_choice != "none"):
+        tools_prompt = format_tools_for_prompt(tools)
+        has_system = any(m.get("role") == "system" for m in messages)
+        if has_system:
+            for m in messages:
+                if m.get("role") == "system":
+                    mm = dict(m)
+                    mm["content"] = _append_text_to_content(m.get("content"), tools_prompt)
+                    processed.append(mm)
+                else:
+                    processed.append(m)
+        else:
+            processed = [{"role": "system", "content": "你是一个有用的助手。" + tools_prompt}] + messages
+
+        if tool_choice in ("required", "auto"):
+            if processed and processed[-1].get("role") == "user":
+                last = dict(processed[-1])
+                last["content"] = _append_text_to_content(last.get("content"), "\n\n请根据需要使用提供的工具函数。")
+                processed[-1] = last
+        elif isinstance(tool_choice, dict) and tool_choice.get("type") == "function":
+            fname = (tool_choice.get("function") or {}).get("name")
+            if fname and processed and processed[-1].get("role") == "user":
+                last = dict(processed[-1])
+                last["content"] = _append_text_to_content(last.get("content"), f"\n\n请使用 {fname} 函数来处理这个请求。")
+                processed[-1] = last
+    else:
+        processed = list(messages)
+
+    final_msgs: List[Dict[str, Any]] = []
+    for m in processed:
+        role = m.get("role")
+        if role in ("tool", "function"):
+            tool_name = m.get("name", "unknown")
+            tool_content = _content_to_str(m.get("content", ""))
+            final_msgs.append({
+                "role": "assistant",
+                "content": f"工具 {tool_name} 返回结果:\n```json\n{tool_content}\n```",
+            })
+        else:
+            mm = dict(m)
+            if isinstance(mm.get("content"), list):
+                mm["content"] = _content_to_str(mm["content"])
+            final_msgs.append(mm)
+    return final_msgs
+
+# ==============================
+# 思考链清洗
+# ==============================
+history_phase = "thinking"
+
+def process_content_by_phase(content: str, phase: str) -> str:
+    global history_phase
+    raw = content
+
+    if content and (phase in ("thinking", "answer") or "summary>" in content):
+        content = re.sub(r"(?s)<details[^>]*?>.*?</details>", "", content)
+        content = content.replace("</thinking>", "").replace("<Full>", "").replace("</Full>", "")
+
+        if THINK_TAGS_MODE == "think":
+            if phase == "thinking":
+                content = content.lstrip("> ").replace("\n>", "\n").strip()
+            content = re.sub(r"\n?<summary>.*?</summary>\n?", "", content, flags=re.DOTALL)
+            content = re.sub(r"<details[^>]*>\n?", "<think>\n\n", content)
+            content = re.sub(r"\n?</details>", "\n\n</think>", content)
+            if phase == "answer":
+                m = re.search(r"(?s)^(.*?</think>)(.*)$", content)
+                if m:
+                    before, after = m.groups()
+                    if after.strip():
+                        if history_phase == "thinking":
+                            content = f"\n\n</think>\n\n{after.lstrip()}"
+                        elif history_phase == "answer":
+                            content = ""
+                    else:
+                        content = "\n\n</think>"
+
+        elif THINK_TAGS_MODE == "pure":
+            if phase == "thinking":
+                content = re.sub(r"\n?<summary>.*?</summary>", "", content, flags=re.DOTALL)
+            content = re.sub(r"<details[^>]*>\n?", "<details type=\"reasoning\">", content)
+            content = re.sub(r"\n?</details>", "\n\n></details>", content)
+            if phase == "answer":
+                m = re.search(r"(?s)^(.*?</details>)(.*)$", content)
+                if m:
+                    _, after = m.groups()
+                    if after.strip():
+                        if history_phase == "thinking":
+                            content = f"\n\n{after.lstrip()}"
+                        elif history_phase == "answer":
+                            content = ""
+                    else:
+                        content = ""
+            content = re.sub(r"</?details[^>]*>", "", content)
+
+        elif THINK_TAGS_MODE == "raw":
+            if phase == "thinking":
+                content = re.sub(r"\n?<summary>.*?</summary>", "", content, flags=re.DOTALL)
+            content = re.sub(r"<details[^>]*>\n?", "<details type=\"reasoning\" open><div>\n\n", content)
+            content = re.sub(r"\n?</details>", "\n\n</div></details>", content)
+            if phase == "answer":
+                m = re.search(r"(?s)^(.*?</details>)(.*)$", content)
+                if m:
+                    before, after = m.groups()
+                    if after.strip():
+                        if history_phase == "thinking":
+                            content = f"\n\n</details>\n\n{after.lstrip()}"
+                        elif history_phase == "answer":
+                            content = ""
+                    else:
+                        dm = re.search(r'duration="(\d+)"', before)
+                        sm = re.search(r"(?s)<summary>.*?</summary>", before)
+                        if sm:
+                            content = f"\n\n</div>{sm.group()}</details>\n\n"
+                        elif dm:
+                            content = f'\n\n</div><summary>Thought for {dm.group(1)} seconds</summary></details>\n\n'
+                        else:
+                            content = "\n\n</div></details>"
+
+    history_phase = phase
+    return content
+
+def extract_content_from_sse(data: Dict[str, Any]) -> str:
+    d = data.get("data", {}) or {}
+    phase = d.get("phase")
+    delta = d.get("delta_content", "") or ""
+    edit = d.get("edit_content", "") or ""
+    content = delta or edit
+    if content and phase in ("answer", "thinking"):
+        return process_content_by_phase(content, phase) or ""
+    return content or ""
+
+# ==============================
+# 工具调用提取
+# ==============================
+_JSON_FENCE = re.compile(r"```json\s*(\{.*?\})\s*```", re.DOTALL)
+_JSON_INLINE = re.compile(r"(\{[^{}]{0,10000}\"tool_calls\".*?\})", re.DOTALL)
+_FUNC_LINE = re.compile(r"调用函数\s*[：:]\s*([\w\-\.]+)\s*(?:参数|arguments)[：:]\s*(\{.*?\})", re.DOTALL)
+
+def try_extract_tool_calls(text: str) -> Optional[List[Dict[str, Any]]]:
+    if not text:
+        return None
+    sample = text[:MAX_JSON_SCAN]
+
+    fences = _JSON_FENCE.findall(sample)
+    for js in fences:
+        try:
+            data = json.loads(js)
+            if "tool_calls" in data and isinstance(data["tool_calls"], list):
+                return data["tool_calls"]
+        except Exception:
+            continue
+
+    m = _JSON_INLINE.search(sample)
+    if m:
+        js = m.group(1)
+        try:
+            data = json.loads(js)
+            if "tool_calls" in data and isinstance(data["tool_calls"], list):
+                return data["tool_calls"]
+        except Exception:
+            pass
+
+    m2 = _FUNC_LINE.search(sample)
+    if m2:
+        fname = m2.group(1).strip()
+        args = m2.group(2).strip()
+        try:
+            json.loads(args)
+            return [{
+                "id": now_ns_id("call"),
+                "type": "function",
+                "function": {"name": fname, "arguments": args},
+            }]
+        except Exception:
+            return None
+
+    return None
+
+def strip_tool_json_from_text(text: str) -> str:
+    def _drop_if_toolcalls(match: re.Match) -> str:
+        block = match.group(1)
+        try:
+            data = json.loads(block)
+            if "tool_calls" in data:
+                return ""
+        except Exception:
+            pass
+        return match.group(0)
+
+    new_text = _JSON_FENCE.sub(_drop_if_toolcalls, text)
+    new_text = _JSON_INLINE.sub("", new_text)
+    return new_text.strip()
+
+# ==============================
 # 路由
-@app.route("/v1/models", methods=["GET", "POST", "OPTIONS"])
+# ==============================
+@app.route("/healthz", methods=["GET"])
+def healthz():
+    resp = make_response("ok", 200)
+    resp.headers["Content-Type"] = "text/plain; charset=utf-8"
+    return set_cors(resp)
+
+@app.route("/v1/models", methods=["GET", "OPTIONS"])
 def models():
-	if request.method == "OPTIONS": return utils.request.response(make_response())
-	try:
-		def format_model_name(name: str) -> str:
-			"""格式化模型名:
-			- 单段: 全大写
-			- 多段: 第一段全大写, 后续段首字母大写
-			- 数字保持不变, 符号原样保留
-			"""
-			if not name: return ""
-			parts = name.split('-')
-			if len(parts) == 1:
-				return parts[0].upper()
-			formatted = [parts[0].upper()]
-			for p in parts[1:]:
-				if not p:
-					formatted.append("")
-				elif p.isdigit():
-					formatted.append(p)
-				elif any(c.isalpha() for c in p):
-					formatted.append(p.capitalize())
-				else:
-					formatted.append(p)
-			return "-".join(formatted)
+    if request.method == "OPTIONS":
+        return preflight()
+    session = get_requests_session()
+    try:
+        headers = {**BROWSER_HEADERS, "Authorization": f"Bearer {get_token(session)}"}
+        r = session.get(f"{API_BASE}/api/models", headers=headers, timeout=HTTP_READ_TIMEOUT)
+        r.raise_for_status()
+        payload = r.json()
+        items = payload.get("data", []) or []
 
-		def is_english_letter(ch: str) -> bool:
-			"""判断是否是英文字符 (A-Z / a-z)"""
-			return 'A' <= ch <= 'Z' or 'a' <= ch <= 'z'
+        def format_model_name(model_id: str, name: Optional[str]) -> str:
+            def is_alpha(ch: str) -> bool:
+                return ("A" <= ch <= "Z") or ("a" <= ch <= "z")
+            if name and len(name) > 0 and is_alpha(name[0]):
+                return name
+            if not model_id:
+                return name or "UNKNOWN"
+            parts = model_id.split("-")
+            if len(parts) == 1:
+                return parts[0].upper()
+            out = [parts[0].upper()]
+            for p in parts[1:]:
+                if not p:
+                    out.append("")
+                elif p.isdigit():
+                    out.append(p)
+                elif any(c.isalpha() for c in p):
+                    out.append(p.capitalize())
+                else:
+                    out.append(p)
+            return "-".join(out)
 
-		headers = {**BROWSER_HEADERS, "Authorization": f"Bearer {utils.request.token()}"}
-		r = requests.get(f"{BASE}/api/models", headers=headers, timeout=8).json()
-		models = []
-		for m in r.get("data", []):
-			if not m.get("info", {}).get("is_active", True):
-				continue
-			model_id, model_name = m.get("id"), m.get("name")
-			if model_id.startswith(("GLM", "Z")):
-				model_name = model_id
-			if not model_name or not is_english_letter(model_name[0]):
-				model_name = format_model_name(model_id)
-			models.append({
-				"id": model_id,
-				"object": "model",
-				"name": model_name,
-				"created": m.get("info", {}).get("created_at", int(datetime.now().timestamp())),
-				"owned_by": "z.ai"
-			})
-		return utils.request.response(jsonify({"object":"list","data":models}))
-	except Exception as e:
-		debug("模型列表失败: %s", e)
-		return utils.request.response(jsonify({"error":"fetch models failed"})), 500
+        models_out = []
+        now_ts = int(time.time())
+        for m in items:
+            info = m.get("info", {}) or {}
+            if not info.get("is_active", True):
+                continue
+            mid = m.get("id")
+            mname = format_model_name(mid, m.get("name"))
+            models_out.append({
+                "id": mid,
+                "object": "model",
+                "name": mname,
+                "created": info.get("created_at", now_ts),
+                "owned_by": "z.ai",
+            })
 
-@app.route("/v1/chat/completions", methods=["GET", "POST", "OPTIONS"])
-def OpenAI_Compatible():
-	if request.method == "OPTIONS": return utils.request.response(make_response())
-	odata = request.get_json(force=True, silent=True) or {}
+        response = set_cors(jsonify({"object": "list", "data": models_out}))
+        response.headers["Content-Type"] = "application/json; charset=utf-8"
+        return response
+    except Exception as e:
+        log.exception("获取模型列表失败: %s", e)
+        err = set_cors(jsonify({"error": {"message": "fetch models failed"}}))
+        err.headers["Content-Type"] = "application/json; charset=utf-8"
+        err.status_code = 500
+        return err
 
-	id = utils.request.id("chat")
-	model = odata.get("model", MODEL)
-	messages = odata.get("messages", [])
-	features = odata.get("features", { "enable_thinking": True })
-	stream = odata.get("stream", False)
-	include_usage = stream and odata.get("stream_options", {}).get("include_usage", False)
+@app.route("/v1/chat/completions", methods=["POST", "OPTIONS"])
+def chat():
+    if request.method == "OPTIONS":
+        return preflight()
 
-	for message in messages:
-		if isinstance(message.get("content"), list):
-			for content_item in message["content"]:
-				if content_item.get("type") == "image_url":
-					url = content_item.get("image_url", {}).get("url", "")
-					if url.startswith("data:"):
-						file_url = utils.request.image(url, id) # 上传图片
-						if file_url:
-							content_item["image_url"]["url"] = file_url # 上传后的图片链接
+    req = request.get_json(force=True, silent=True) or {}
+    chat_id = now_ns_id("chat")
+    msg_id = now_ns_id("msg")
+    model = req.get("model") or DEFAULT_MODEL
 
-	data = {
-		**odata, 
-		"stream": True,
-		"chat_id": id,
-		"id": utils.request.id(),
-		"model": model,
-		"messages": messages,
-		"features": features
-	}
+    tools = req.get("tools", [])
+    tool_choice = req.get("tool_choice")
 
-	try:
-		response = utils.request.chat(data, id)
-	except Exception as e:
-		return utils.request.response(make_response(f"上游请求失败: {e}", 502))
+    processed_messages = process_messages_with_tools(req.get("messages", []), tools, tool_choice)
 
-	prompt_tokens = utils.response.count("".join(
-		c if isinstance(c, str) else (c.get("text", "") if isinstance(c, dict) and c.get("type") == "text" else "")
-		for m in messages
-		for c in ([m["content"]] if isinstance(m.get("content"), str) else (m.get("content") or []))
-	))
-	if stream:
-		def stream():
-			completion_str = ""
+    upstream_data = {
+        "stream": bool(req.get("stream", False)),
+        "chat_id": chat_id,
+        "id": msg_id,
+        "model": model,
+        "messages": processed_messages,
+        "features": {"enable_thinking": True},
+        **{k: v for k, v in req.items() if k in ("temperature", "top_p", "max_tokens")},
+    }
 
-			# 处理流式响应数据
-			for data in utils.response.parse(response):
-				is_done = data.get("data", {}).get("done", False)
-				delta = utils.response.format(data)
-				finish_reason = "stop" if is_done else None
+    session = get_requests_session()
+    try:
+        upstream = call_upstream_chat(session, upstream_data, chat_id)
+    except Exception as e:
+        resp = make_response(f"上游调用失败: {e}", 502)
+        resp.headers["Content-Type"] = "text/plain; charset=utf-8"
+        return set_cors(resp)
 
-				if delta:
-					yield f"data: {json.dumps({
-						"id": utils.request.id('chatcmpl'),
-						"object": "chat.completion.chunk",
-						"created": int(datetime.now().timestamp()),
-						"model": model,
-						"choices": [
-							{
-								"index": 0,
-								"delta": delta,
-								"message": delta,
-								"finish_reason": finish_reason
-							}
-						]
-					})}\n\n"
+    created_ts = int(time.time())
 
-					# 累积实际生成的内容
-					if "content" in delta:
-						completion_str += delta["content"]
-					if "reasoning_content" in delta:
-						completion_str += delta["reasoning_content"]
-					completion_tokens = utils.response.count(completion_str) # 计算 tokens
-				if is_done:
-					yield f"data: {json.dumps({
-						'id': utils.request.id('chatcmpl'),
-						'object': 'chat.completion.chunk',
-						'created': int(datetime.now().timestamp()),
-						'model': model,
-						'choices': [
-							{
-								'index': 0,
-								'delta': {"role": "assistant"},
-								'message': {"role": "assistant"},
-								'finish_reason': "stop"
-							}
-						]
-					})}\n\n"
-					break
+    # --------- 流式 ----------
+    if req.get("stream"):
+        def event_stream() -> Iterable[str]:
+            last_ping = time.time()
+            acc_content = ""
+            tool_calls: Optional[List[Dict[str, Any]]] = None
+            buffering_only = FUNCTION_CALL_ENABLED and bool(tools)
 
-			if include_usage:
-				# 发送 usage 统计信息
-				yield f"data: {json.dumps({
-					"id": utils.request.id('chatcmpl'),
-					"object": "chat.completion.chunk",
-					"created": int(datetime.now().timestamp()),
-					"model": model,
-					"choices": [],
-					"usage": {
-						"prompt_tokens": prompt_tokens,
-						"completion_tokens": completion_tokens,
-						"total_tokens": prompt_tokens + completion_tokens
-					}
-				})}\n\n"
+            # 首块：role
+            first_chunk = {
+                "id": now_ns_id("chatcmpl"),
+                "object": "chat.completion.chunk",
+                "created": created_ts,
+                "model": model,
+                "choices": [{"index": 0, "delta": {"role": "assistant"}}],
+            }
+            yield f"data: {json.dumps(first_chunk, ensure_ascii=False)}\n\n"
 
-			# 发送 [DONE] 标志，表示流结束
-			yield "data: [DONE]\n\n"
+            for data in parse_upstream_sse(upstream):
+                if time.time() - last_ping >= SSE_HEARTBEAT_SECONDS:
+                    yield ": keep-alive\n\n"
+                    last_ping = time.time()
 
-		# 返回 Flask 的流式响应
-		return Response(stream(), mimetype="text/event-stream")
-	else:
-		# 上游不支持非流式，所以先用流式获取所有内容
-		contents = {
-			"content": [],
-			"reasoning_content": []
-		}
-		for odata in utils.response.parse(response):
-			if odata.get("data", {}).get("done"):
-				break
-			delta = utils.response.format(odata)
-			if delta:
-				if "content" in delta:
-					contents["content"].append(delta["content"])
-				if "reasoning_content" in delta:
-					contents["reasoning_content"].append(delta["reasoning_content"])
+                if (data.get("data") or {}).get("done"):
+                    if buffering_only:
+                        tool_calls = try_extract_tool_calls(acc_content)
+                        if tool_calls:
+                            out = {
+                                "id": now_ns_id("chatcmpl"),
+                                "object": "chat.completion.chunk",
+                                "created": created_ts,
+                                "model": model,
+                                "choices": [{"index": 0, "delta": {"tool_calls": []}}],
+                            }
+                            for i, tc in enumerate(tool_calls):
+                                out["choices"][0]["delta"]["tool_calls"].append({
+                                    "index": i,
+                                    "id": tc.get("id"),
+                                    "type": tc.get("type", "function"),
+                                    "function": tc.get("function", {}),
+                                })
+                            yield f"data: {json.dumps(out, ensure_ascii=False)}\n\n"
+                            finish = "tool_calls"
+                        else:
+                            trimmed = strip_tool_json_from_text(acc_content)
+                            if trimmed:
+                                chunk = {
+                                    "id": now_ns_id("chatcmpl"),
+                                    "object": "chat.completion.chunk",
+                                    "created": created_ts,
+                                    "model": model,
+                                    "choices": [{"index": 0, "delta": {"content": trimmed}}],
+                                }
+                                yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+                            finish = "stop"
+                    else:
+                        finish = "stop"
 
-		# 构建最终消息内容
-		final_message = {"role": "assistant"}
-		completion_str = ""
-		if contents["reasoning_content"]:
-			final_message["reasoning_content"] = "".join(contents["reasoning_content"])
-			completion_str += "".join(contents["reasoning_content"])
-		if contents["content"]:
-			final_message["content"] = "".join(contents["content"])
-			completion_str += "".join(contents["content"])
-		completion_tokens = utils.response.count(completion_str) # 计算 tokens
+                    tail = {
+                        "id": now_ns_id("chatcmpl"),
+                        "object": "chat.completion.chunk",
+                        "created": created_ts,
+                        "model": model,
+                        "choices": [{"index": 0, "delta": {}, "finish_reason": finish}],
+                    }
+                    yield f"data: {json.dumps(tail, ensure_ascii=False)}\n\n"
+                    yield "data: [DONE]\n\n"
+                    return
 
-		# 返回 Flask 响应
-		return utils.request.response(jsonify({
-			"id": utils.request.id("chatcmpl"),
-			"object": "chat.completion",
-			"created": int(datetime.now().timestamp()),
-			"model": model,
-			"choices": [{
-				"index": 0,
-				"delta": final_message,
-				"message": final_message,
-				"finish_reason": "stop"
-			}],
-			"usage": {
-				"prompt_tokens": prompt_tokens,
-				"completion_tokens": completion_tokens,
-				"total_tokens": prompt_tokens + completion_tokens
-			}
-		}))
+                piece = extract_content_from_sse(data)
+                if not piece:
+                    continue
 
+                if buffering_only:
+                    acc_content += piece  # 工具模式：全程缓冲
+                else:
+                    chunk = {
+                        "id": now_ns_id("chatcmpl"),
+                        "object": "chat.completion.chunk",
+                        "created": created_ts,
+                        "model": model,
+                        "choices": [{"index": 0, "delta": {"content": piece}}],
+                    }
+                    yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
+
+        resp = Response(event_stream())
+        resp.headers["Content-Type"] = "text/event-stream; charset=utf-8"
+        resp.headers["Cache-Control"] = "no-cache"
+        resp.headers["Connection"] = "keep-alive"
+        resp.headers["X-Accel-Buffering"] = "no"
+        return set_cors(resp)
+
+    # --------- 非流式 ----------
+    full_text = ""
+    for d in parse_upstream_sse(upstream):
+        full_text += extract_content_from_sse(d)
+
+    tool_calls = None
+    finish_reason = "stop"
+    if FUNCTION_CALL_ENABLED and tools:
+        tool_calls = try_extract_tool_calls(full_text)
+        if tool_calls:
+            # content 必须为 null（OpenAI 规范）
+            full_text = strip_tool_json_from_text(full_text)
+            finish_reason = "tool_calls"
+
+    message: Dict[str, Any] = {
+        "role": "assistant",
+        "content": None if tool_calls else (full_text or ""),
+    }
+    if tool_calls:
+        message["tool_calls"] = tool_calls
+
+    resp_body = {
+        "id": now_ns_id("chatcmpl"),
+        "object": "chat.completion",
+        "created": created_ts,
+        "model": model,
+        "choices": [{"index": 0, "message": message, "finish_reason": finish_reason}],
+        "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+    }
+    response = set_cors(jsonify(resp_body))
+    response.headers["Content-Type"] = "application/json; charset=utf-8"
+    return response
+
+# ==============================
 # 主入口
+# ==============================
 if __name__ == "__main__":
-	log.info("---------------------------------------------------------------------")
-	log.info("Z.ai 2 API")
-	log.info("将 Z.ai 代理为 OpenAI Compatible 格式")
-	log.info("基于 https://github.com/kbykb/OpenAI-Compatible-API-Proxy-for-Z 重构")
-	log.info("---------------------------------------------------------------------")
-	log.info("服务端口：%s", PORT)
-	log.info("备选模型：%s", MODEL)
-	log.info("思考处理：%s", THINK_TAGS_MODE)
-	log.info("访客模式：%s", ANONYMOUS_MODE)
-	log.info("显示调试：%s", DEBUG_MODE)
-	app.run(host="0.0.0.0", port=PORT, threaded=True, debug=DEBUG_MODE)
+    log.info(
+        "代理启动: port=%s, default_model=%s, think_mode=%s, func_call=%s, debug=%s",
+        DEFAULT_PORT, DEFAULT_MODEL, THINK_TAGS_MODE, FUNCTION_CALL_ENABLED, DEBUG_MODE
+    )
+    app.run(host="0.0.0.0", port=DEFAULT_PORT, threaded=True)
