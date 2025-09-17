@@ -51,8 +51,19 @@
 
 ## 使用
 ```
-git clone https://github.com/hmjz100/Z.ai2api.git
-cd Z.ai2api
-pip install -r requirements.txt
-python app.py
+git clone https://github.com/Mitchll1214/z.ai2api-glm.git
+cd z.ai2api-glm
+docker build -t zai2api .
+
+# Docker 运行命令
+docker run -d -p 8080:8080 \
+  -e BASE="https://chat.z.ai" \
+  -e PORT="8080" \
+  -e MODEL="GLM-4.5" \
+  -e TOKEN="your_secret_token_here" \
+  -e ANONYMOUS_MODE="false" \
+  -e THINK_TAGS_MODE="reasoning" \
+  -e DEBUG_MODE="true" \
+  --name zai2api \
+  zai2api
 ```
