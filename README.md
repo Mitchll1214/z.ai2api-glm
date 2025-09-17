@@ -48,7 +48,7 @@
 ### `DEBUG_MODE`
   - 显示调试信息，启用后将显示一些调试信息
   - 默认值：`false`
-
+  - DEBUG_MODE 会有大量日志，如果测试成功可以设为 false
 ## 使用
 ```
 git clone https://github.com/Mitchll1214/z.ai2api-glm.git
